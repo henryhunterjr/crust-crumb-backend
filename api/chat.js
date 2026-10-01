@@ -64,27 +64,48 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    const model = genAI.getGenerativeModel({ 
-      model: 'gemini-pro',
-      systemInstruction: KRUSTY_SYSTEM_PROMPT
-    });
+    // Gemini needs history to open with a user turn and alternate roles
+    const cleaned = [];
+    for (const msg of Array.isArray(history) ? history : []) {
+      if (!msg || typeof msg.text !== 'string' || !msg.text.trim()) continue;
+      const role = msg.role === 'user' ? 'user' : 'model';
+      if (!cleaned.length && role !== 'user') continue;
+      const last = cleaned[cleaned.length - 1];
+      if (last && last.role === role) {
+        last.parts[0].text += `\n\n${msg.text}`;
+      } else {
+        cleaned.push({ role, parts: [{ text: msg.text }] });
+      }
+    }
+    if (cleaned.length && cleaned[cleaned.length - 1].role === 'user') cleaned.pop();
 
-    // Format history for Gemini API
-    const formattedHistory = history.map(msg => ({
-      role: msg.role === 'user' ? 'user' : 'model',
-      parts: [{ text: msg.text }]
-    }));
-
-    const chat = model.startChat({
-      history: formattedHistory,
-      generationConfig: {
-        maxOutputTokens: 1000,
-        temperature: 0.7,
-      },
-    });
-
-    const result = await chat.sendMessage(message);
-    const response = result.response.text();
+    // gemini-pro was retired; try current models in order
+    const candidates = [process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.0-flash'].filter(Boolean);
+    let response;
+    let lastError;
+    for (const modelName of candidates) {
+      try {
+        const model = genAI.getGenerativeModel({
+          model: modelName,
+          systemInstruction: KRUSTY_SYSTEM_PROMPT
+        });
+        const chat = model.startChat({
+          history: cleaned,
+          generationConfig: {
+            maxOutputTokens: 1000,
+            temperature: 0.7,
+          },
+        });
+        const result = await chat.sendMessage(message);
+        response = result.response.text();
+        break;
+      } catch (err) {
+        lastError = err;
+        if (err && err.status !== 404) throw err;
+        console.warn(`Gemini model ${modelName} unavailable, trying next`);
+      }
+    }
+    if (response === undefined) throw lastError;
 
     return res.status(200).json({ response });
   } catch (error) {
